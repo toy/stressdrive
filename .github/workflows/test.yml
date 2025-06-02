@@ -13,16 +13,8 @@ jobs:
       fail-fast: false
     steps:
     - uses: actions/checkout@v4
-    - name: build
-      run: |
-        if [[ "$RUNNER_OS" == "macOS" ]]; then
-          brew install openssl@3
-          export OPENSSL_DIR=$(brew --prefix openssl@3)
-          gcc stressdrive.c -o stressdrive -lcrypto -framework IOKit -framework CoreServices -I"$OPENSSL_DIR/include" -L"$OPENSSL_DIR/lib"
-        elif [[ "$RUNNER_OS" == "Linux" ]]; then
-          sudo apt-get install libssl-dev
-          gcc stressdrive.c -o stressdrive -lcrypto
-        fi
+      with:
+        fetch-depth: 0
     - name: create ram disk
       run: |
         if [[ "$RUNNER_OS" == "macOS" ]]; then
@@ -37,18 +29,29 @@ jobs:
           sudo chmod 777 "$ram_disk"
           ln -s "$ram_disk" ram_disk
         fi
-    - name: test ram disk entropy when filled with zero(e)s
-      run: |
-        head -c $(( 256 * 1024 * 1024 )) ram_disk > 256M
-        ! ./test_entropy 256M
-    - name: run stressdrive on ram disk
+    - name: benchmark
       shell: bash -eo pipefail {0}
       run: |
-        ./stressdrive ram_disk | tee output
-    - name: check the hash list checksum
-      run: |
-        grep $(./hash_list_checksum ram_disk) output
-    - name: test ram disk entropy when filled with random data
-      run: |
-        head -c $(( 256 * 1024 * 1024 )) ram_disk > 256M
-        ./test_entropy 256M
+        git config user.email "not@important.com"
+        git config user.name "Not Important"
+
+        if [[ "$RUNNER_OS" == "macOS" ]]; then
+          export OPENSSL_DIR=$(brew --prefix openssl@3)
+        elif [[ "$RUNNER_OS" == "Linux" ]]; then
+          sudo apt-get install libssl-dev
+        fi
+
+        for branch in develop aes-ctr faster faster-simpler-but-more-buffers; do
+          echo "# $branch ################"
+          git checkout --quiet "$branch"
+          git rebase --quiet benchmark
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            gcc stressdrive.c -o stressdrive -lcrypto -framework IOKit -framework CoreServices -I"$OPENSSL_DIR/include" -L"$OPENSSL_DIR/lib"
+          elif [[ "$RUNNER_OS" == "Linux" ]]; then
+            gcc stressdrive.c -o stressdrive -lcrypto
+          fi
+          for i in 1 2 3; do
+            echo "## try $i"
+            ./stressdrive ram_disk | tr '\r' '\n' | grep '100.0%'
+          done
+        done

@@ -4,6 +4,7 @@
 //   https://github.com/rentzsch/stressdrive
 
 #define _BSD_SOURCE
+#define _DEFAULT_SOURCE
 
 #include <fcntl.h>
 #include <inttypes.h>
@@ -30,6 +31,9 @@
 #include <linux/fs.h>
 #endif
 
+#define HASH_DIGEST_LENGTH SHA_DIGEST_LENGTH
+#define HASH_INIT_FUNCTION EVP_sha1
+
 #define EXIT_CALL_FAILED 2
 
 #define MAX(a, b)                                                              \
@@ -50,31 +54,50 @@
 #define MEGA 1000000
 #define GIGA 1000000000
 
+#ifdef CLOCK_UPTIME_RAW
+#define MONOTONIC_CLOCK_ID CLOCK_UPTIME_RAW
+#else
+#define MONOTONIC_CLOCK_ID CLOCK_MONOTONIC
+#endif
+
 typedef struct {
     uint64_t total;
     const char *name;
-    struct timeval start, last_display;
+    uint64_t start, last_display;
 } PROGRESS_CTX;
+
+uint64_t monotonic_time_ms() {
+    struct timespec ts;
+    clock_gettime(MONOTONIC_CLOCK_ID, &ts);
+    return ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+void print_ms_human(uint64_t ms, const char *prefix, const char *suffix) {
+    uint64_t s = ms / 1000;
+    uint64_t m = s / 60;
+    uint64_t h = m / 60;
+    printf("%s%02" PRIu64 ":%02" PRIu64 ":%02" PRIu64 "%s", prefix, h, m % 60,
+           s % 60, suffix);
+}
 
 void PROGRESS_Init(PROGRESS_CTX *ctx, uint64_t total, const char *name) {
     ctx->total = total;
     ctx->name = name;
-    gettimeofday(&ctx->start, NULL);
-    ctx->last_display = (struct timeval){0};
+    ctx->start = monotonic_time_ms();
+    ctx->last_display = 0;
 }
 
-void _PROGRESS_Print(PROGRESS_CTX *ctx, struct timeval *now, uint64_t current,
+void _PROGRESS_Print(PROGRESS_CTX *ctx, uint64_t now, uint64_t current,
                      uint32_t blockSize) {
     double complete = (double)current / (double)ctx->total;
     printf("\r%s %.1f%% (%" PRIu64 " of %" PRIu64 ")", ctx->name,
            complete * 100.0, current, ctx->total);
 
-    uint64_t elapsed = now->tv_sec - ctx->start.tv_sec;
-    printf(" %02" PRIu64 ":%02" PRIu64 ":%02" PRIu64 "", elapsed / 3600,
-           (elapsed / 60) % 60, elapsed % 60);
+    uint64_t elapsed = now - ctx->start;
+    print_ms_human(elapsed, " ", "");
 
     if (elapsed > 0) {
-        double speed = (double)current * blockSize / elapsed;
+        double speed = (double)current * blockSize * 1000 / elapsed;
 
         if (speed > GIGA) {
             printf(" (%.1f GB/s)", speed / GIGA);
@@ -87,10 +110,9 @@ void _PROGRESS_Print(PROGRESS_CTX *ctx, struct timeval *now, uint64_t current,
         }
     }
 
-    if (current != ctx->total && elapsed > 10 && complete > 0.001) {
+    if (current != ctx->total && elapsed > 10000 && complete > 0.001) {
         uint64_t eta = (1 / complete - 1) * elapsed;
-        printf(" (ETA: %02" PRIu64 ":%02" PRIu64 ":%02" PRIu64 ")", eta / 3600,
-               (eta / 60) % 60, eta % 60);
+        print_ms_human(eta, " (ETA: ", ")");
     }
 
     printf("\e[K");
@@ -98,19 +120,16 @@ void _PROGRESS_Print(PROGRESS_CTX *ctx, struct timeval *now, uint64_t current,
 }
 
 void PROGRESS_Update(PROGRESS_CTX *ctx, uint64_t current, uint32_t blockSize) {
-    struct timeval now, delta;
-    gettimeofday(&now, NULL);
-    timersub(&now, &ctx->last_display, &delta);
-    if (delta.tv_sec < 1)
+    uint64_t now = monotonic_time_ms();
+    if (now - ctx->last_display < 1000)
         return;
     ctx->last_display = now;
-    _PROGRESS_Print(ctx, &now, current, blockSize);
+    _PROGRESS_Print(ctx, now, current, blockSize);
 }
 
 void PROGRESS_Finish(PROGRESS_CTX *ctx, uint32_t blockSize) {
-    struct timeval now;
-    gettimeofday(&now, NULL);
-    _PROGRESS_Print(ctx, &now, ctx->total, blockSize);
+    uint64_t now = monotonic_time_ms();
+    _PROGRESS_Print(ctx, now, ctx->total, blockSize);
     printf("\n");
 }
 
@@ -120,7 +139,7 @@ void PROGRESS_Finish(PROGRESS_CTX *ctx, uint32_t blockSize) {
 #endif
 
 void DIGEST_Init(EVP_MD_CTX *digestContext) {
-    if (1 != EVP_DigestInit_ex(digestContext, EVP_sha1(), NULL)) {
+    if (1 != EVP_DigestInit_ex(digestContext, HASH_INIT_FUNCTION(), NULL)) {
         fprintf(stderr, "Digest initialisation failed\n");
         exit(EXIT_CALL_FAILED);
     }
@@ -141,10 +160,10 @@ void DIGEST_Final(EVP_MD_CTX *digestContext, unsigned char *digest) {
 }
 
 void DIGEST_Print(unsigned char *digest, const char *name) {
-    for (size_t i = 0; i < SHA_DIGEST_LENGTH; i++) {
+    for (size_t i = 0; i < HASH_DIGEST_LENGTH; i++) {
         printf("%02x", digest[i]);
     }
-    printf(" <= SHA-1 of %s data\n", name);
+    printf(" <= root hash digest of %s data\n", name);
 }
 
 int main(int argc, const char *argv[]) {
@@ -205,8 +224,8 @@ int main(int argc, const char *argv[]) {
 
     uint16_t bufferBlocks = bufferSize / blockSize;
     uint32_t checkFrequency = 1024 * 1024 * 1024 / blockSize;
-    uint64_t checkCount = (blockCount + bufferBlocks - 1) / checkFrequency;
-    uint8_t *checkDigests = malloc(checkCount * SHA_DIGEST_LENGTH);
+    uint64_t checkCount = (blockCount + checkFrequency - 1) / checkFrequency;
+    uint8_t *checkDigests = malloc(checkCount * HASH_DIGEST_LENGTH);
     if (checkDigests == NULL) {
         perror("malloc() failed");
         exit(EXIT_CALL_FAILED);
@@ -224,8 +243,9 @@ int main(int argc, const char *argv[]) {
     }
 #endif
 
-    EVP_MD_CTX *digestContext;
-    if ((digestContext = EVP_MD_CTX_new()) == NULL) {
+    EVP_MD_CTX *digestContext, *rootDigestContext;
+    if ((digestContext = EVP_MD_CTX_new()) == NULL ||
+        (rootDigestContext = EVP_MD_CTX_new()) == NULL) {
         fprintf(stderr, "Digest context creation failed\n");
         exit(EXIT_CALL_FAILED);
     }
@@ -285,19 +305,25 @@ int main(int argc, const char *argv[]) {
         DIGEST_Update(digestContext, buffer, size);
         PROGRESS_Update(&progress, blockIndex, blockSize);
 
-        if ((blockIndex + bufferBlocks) % checkFrequency == 0) {
+        uint64_t hashedBlocks = blockIndex + bufferBlocks;
+        if (hashedBlocks % checkFrequency == 0 || hashedBlocks >= blockCount) {
             uint64_t checkIndex = blockIndex / checkFrequency;
             DIGEST_Final(digestContext,
-                         checkDigests + checkIndex * SHA_DIGEST_LENGTH);
-            DIGEST_Init(digestContext);
+                         checkDigests + checkIndex * HASH_DIGEST_LENGTH);
+            if (hashedBlocks < blockCount) {
+                DIGEST_Init(digestContext);
+            }
         }
     }
     PROGRESS_Finish(&progress, blockSize);
     EVP_CIPHER_CTX_free(aes);
 
-    uint8_t writtenShaDigest[SHA_DIGEST_LENGTH];
-    DIGEST_Final(digestContext, writtenShaDigest);
-    DIGEST_Print(writtenShaDigest, "written");
+    uint8_t writtenHashDigest[HASH_DIGEST_LENGTH];
+    DIGEST_Init(rootDigestContext);
+    DIGEST_Update(rootDigestContext, checkDigests,
+                  checkCount * HASH_DIGEST_LENGTH);
+    DIGEST_Final(rootDigestContext, writtenHashDigest);
+    DIGEST_Print(writtenHashDigest, "written");
 
     if (lseek(fd, 0LL, SEEK_SET) != 0LL) {
         perror("lseek() failed");
@@ -305,10 +331,11 @@ int main(int argc, const char *argv[]) {
     }
 
     int exitCode = EXIT_SUCCESS;
-    uint8_t readShaDigest[SHA_DIGEST_LENGTH];
+    uint8_t readHashDigest[HASH_DIGEST_LENGTH];
 
     printf("verifying written data\n");
     DIGEST_Init(digestContext);
+    DIGEST_Init(rootDigestContext);
     PROGRESS_Init(&progress, blockCount, "reading");
     for (uint64_t blockIndex = 0; blockIndex < blockCount;
          blockIndex += bufferBlocks) {
@@ -322,27 +349,33 @@ int main(int argc, const char *argv[]) {
         DIGEST_Update(digestContext, buffer, size);
         PROGRESS_Update(&progress, blockIndex, blockSize);
 
-        if ((blockIndex + bufferBlocks) % checkFrequency == 0) {
+        uint64_t hashedBlocks = blockIndex + bufferBlocks;
+        if (hashedBlocks % checkFrequency == 0 || hashedBlocks >= blockCount) {
             uint64_t checkIndex = blockIndex / checkFrequency;
-            DIGEST_Final(digestContext, readShaDigest);
-            DIGEST_Init(digestContext);
-            if (bcmp(checkDigests + checkIndex * SHA_DIGEST_LENGTH,
-                     readShaDigest, SHA_DIGEST_LENGTH) != 0) {
+            DIGEST_Final(digestContext, readHashDigest);
+            DIGEST_Update(rootDigestContext, readHashDigest,
+                          HASH_DIGEST_LENGTH);
+            if (bcmp(checkDigests + checkIndex * HASH_DIGEST_LENGTH,
+                     readHashDigest, HASH_DIGEST_LENGTH) != 0) {
                 printf("\nFailed intermediate checksum for bytes %" PRIu64
                        "...%" PRIu64 "\n",
                        (blockIndex + bufferBlocks - checkFrequency) * blockSize,
                        blockIndex * blockSize + size);
                 exitCode = EXIT_FAILURE;
             }
+            if (hashedBlocks < blockCount) {
+                DIGEST_Init(digestContext);
+            }
         }
     }
     PROGRESS_Finish(&progress, blockSize);
-    DIGEST_Final(digestContext, readShaDigest);
-    DIGEST_Print(readShaDigest, "read");
+    DIGEST_Final(rootDigestContext, readHashDigest);
+    DIGEST_Print(readHashDigest, "read");
     EVP_MD_CTX_free(digestContext);
+    EVP_MD_CTX_free(rootDigestContext);
 
     if (exitCode == EXIT_SUCCESS &&
-        bcmp(writtenShaDigest, readShaDigest, SHA_DIGEST_LENGTH) == 0) {
+        bcmp(writtenHashDigest, readHashDigest, HASH_DIGEST_LENGTH) == 0) {
         printf("SUCCESS\n");
     } else {
         printf("FAILURE\n");
